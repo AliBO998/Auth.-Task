@@ -1,0 +1,200 @@
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import roc_auc_score, roc_curve
+from lightgbm import LGBMClassifier
+import matplotlib.pyplot as plt
+
+def auth(training_file_paths, testing_file_paths, used_device, TEST_N):
+    # Load dataset from a txt file
+    def load_dataset(file_path, target_user):
+        df = pd.read_csv(file_path, header=None, names=['time', 'x', 'y', 'z'])
+        data = df[['x', 'y', 'z']].values.astype(np.float32)
+        targets = np.array([1 if target_user else 0] * len(data), dtype=np.float32)
+        return data, targets, df
+
+    print("Training and validating for", used_device, "using LGBM method...")
+
+    # To store ROC data for all users (for combined plotting)
+    all_users_roc_data = []
+
+    # Process each user (each training file becomes the positive class for that user)
+    for u in range(len(training_file_paths)):
+        print(f"\n=== Processing Authentication for User {u+1} ===")
+        X_train_list, y_train_list = [], []
+        # Assemble training data: positive if file index equals u, else negative
+        for i, file_path in enumerate(training_file_paths):
+            data, targets, _ = load_dataset(file_path, target_user=(i == u))
+            X_train_list.append(data)
+            y_train_list.append(targets)
+        X_train = np.vstack(X_train_list)
+        y_train = np.hstack(y_train_list)
+
+        # Normalize the training data
+        scaler = StandardScaler()
+        X_train = scaler.fit_transform(X_train)
+
+        # Train LightGBM classifier
+        model = LGBMClassifier()
+        model.fit(X_train, y_train)
+
+        # Evaluate model: run multiple iterations for stability of metrics
+        confusion_results = []
+        roc_data = {}
+        num_iterations = 20
+
+        for iter_id in range(num_iterations):
+            tp, tn, fp, fn = 0, 0, 0, 0
+            all_labels = []
+            all_scores = []
+            # Loop over each testing file
+            for i, file_path in enumerate(testing_file_paths):
+                X_test, y_test, _ = load_dataset(file_path, target_user=(i == u))
+                X_test = scaler.transform(X_test)
+                # Predict probability for positive class
+                probs = model.predict_proba(X_test)[:, 1]
+                # Use a threshold of 0.5 to make a binary prediction
+                predictions = (probs > 0.5).astype(np.float32)
+                all_labels.extend(y_test)
+                all_scores.extend(probs)
+                tp += np.sum((predictions == 1) & (y_test == 1))
+                tn += np.sum((predictions == 0) & (y_test == 0))
+                fp += np.sum((predictions == 1) & (y_test == 0))
+                fn += np.sum((predictions == 0) & (y_test == 1))
+
+            fnr = 100 * fn / (fn + tp) if (fn + tp) > 0 else 0
+            fpr = 100 * fp / (fp + tn) if (fp + tn) > 0 else 0
+            tpr = 100 * tp / (tp + fn) if (tp + fn) > 0 else 0
+            tnr = 100 * tn / (tn + fp) if (tn + fp) > 0 else 0
+            accuracy = 100 * (tp + tn) / (tp + tn + fp + fn) if (tp + tn + fp + fn) > 0 else 0
+            f1_score = 100 * (2 * tp) / (2 * tp + fp + fn) if (2 * tp + fp + fn) > 0 else 0
+
+            try:
+                oc_auc = roc_auc_score(all_labels, all_scores) * 100
+                fpr_curve, tpr_curve, thresholds = roc_curve(all_labels, all_scores)
+                fnr_curve = 1 - tpr_curve
+                idx_eer = np.nanargmin(np.abs(fpr_curve - fnr_curve))
+                eer_percentage = fpr_curve[idx_eer] * 100
+            except Exception as e:
+                oc_auc = 0.0
+                eer_percentage = 0.0
+
+            confusion_results.append([tp, tn, fp, fn, fnr, fpr, tpr, tnr, accuracy, f1_score, oc_auc, eer_percentage])
+            # For ROC plotting, store data from the last iteration
+            if iter_id == num_iterations - 1:
+                roc_data = {'fpr': fpr_curve, 'tpr': tpr_curve, 'auc': oc_auc}
+
+        # Define metric names including the new metrics
+        metric_names = ["TP", "TN", "FP", "FN", "FNR", "FPR", "TPR", "TNR", "Accuracy", "F1-score", "OC AUC", "EER%"]
+        iterations = list(range(1, num_iterations + 1))
+        iteration_results = pd.DataFrame(confusion_results, columns=metric_names)
+        iteration_results.insert(0, "Iteration", iterations)
+
+        # Compute summary statistics
+        metrics_array = np.array(confusion_results)
+        avg_metrics = np.mean(metrics_array, axis=0)
+        std_metrics = np.std(metrics_array, axis=0)
+        summary_results = pd.DataFrame([
+            ["Average"] + list(avg_metrics),
+            ["Std Dev"] + list(std_metrics)
+        ], columns=["Metric"] + metric_names)
+
+        # Save confusion metrics to Excel (one file per user)
+        excel_path = f"D:/Spring semester 2025/MLS/Results/LGBM/confusion_table_LGBM_{used_device}{u+1}.xlsx"
+        with pd.ExcelWriter(excel_path) as writer:
+            iteration_results.to_excel(writer, sheet_name="Iteration Metrics", index=False)
+            summary_results.to_excel(writer, sheet_name="Summary", index=False)
+        print(f"Confusion table with iteration metrics and summary saved to {excel_path}")
+
+        # Store this user's ROC data for combined plotting
+        all_users_roc_data.append({'user': u+1, 'fpr': roc_data['fpr'], 'tpr': roc_data['tpr'], 'auc': roc_data['auc']})
+
+    # -------------------------------
+    # After processing all users, plot all ROC curves in one figure
+    # -------------------------------
+    plt.figure(figsize=(10, 8))
+    for data in all_users_roc_data:
+        plt.plot(data['fpr'], data['tpr'], label=f'User {data["user"]} (AUC = {data["auc"]:.2f})')
+    plt.plot([0, 1], [0, 1], 'k--')
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+    plt.title('ROC Curves for All Users (LGBM)')
+    # Place legend outside the plot (top-right)
+    plt.legend(loc='upper left', bbox_to_anchor=(1.05, 1), borderaxespad=0.)
+    
+    # Save the combined ROC plot as a JPG file in the same folder as Excel outputs
+    roc_jpg_path = f"D:/Spring semester 2025/MLS/Results/LGBM/ROC_all_users_{used_device}.jpg"
+    plt.savefig(roc_jpg_path, format="jpg", bbox_inches='tight')
+    print(f"Combined ROC curve plot saved as '{roc_jpg_path}'.")
+
+    # -------------------------------
+    # Generate Excel file with ROC curve data for each user
+    # -------------------------------
+    roc_excel_path = f"D:/Spring semester 2025/MLS/Results/LGBM/roc_curves_LGBM_{used_device}.xlsx"
+    with pd.ExcelWriter(roc_excel_path) as writer:
+        auc_summary = []
+        for data in all_users_roc_data:
+            # Create a DataFrame for the ROC data of this user
+            df = pd.DataFrame({'FPR': data['fpr'], 'TPR': data['tpr']})
+            # Save it to a separate sheet named "User X"
+            df.to_excel(writer, sheet_name=f'User {data["user"]}', index=False)
+            auc_summary.append({'User': data['user'], 'AUC': data['auc']})
+        # Also save an AUC summary sheet
+        summary_df = pd.DataFrame(auc_summary)
+        summary_df.to_excel(writer, sheet_name='AUC Summary', index=False)
+    print(f"ROC curves data saved as Excel at {roc_excel_path}")
+    #plt.show()
+
+
+# --------------------------------------------------
+# Set file paths for training and testing, then call the auth function.
+# --------------------------------------------------
+used_device = 'SAM'
+TEST_N = 350   # Number of samples for the target user in testing; others get TEST_N/16
+training_file_paths = [
+    "D:/Spring semester 2025/MLS/First Data set/data/Compressed Training Data/User001/Samsung - back/linearAccelDataM_compressed.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Compressed Training Data/User002/Samsung - back/linearAccelDataM_compressed.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Compressed Training Data/User003/Samsung - back/linearAccelDataM_compressed.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Compressed Training Data/User004/Samsung - back/linearAccelDataM_compressed.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Compressed Training Data/User005/Samsung - back/linearAccelDataM_compressed.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Compressed Training Data/User006/Samsung - back/linearAccelDataM_compressed.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Compressed Training Data/User007/Samsung - back/linearAccelDataM_compressed.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Compressed Training Data/User008/Samsung - back/linearAccelDataM_compressed.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Compressed Training Data/User009/Samsung - back/linearAccelDataM_compressed.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Compressed Training Data/User0010/Samsung - back/linearAccelDataM_compressed.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Compressed Training Data/User0011/Samsung - back/linearAccelDataM_compressed.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Compressed Training Data/User0012/Samsung - back/linearAccelDataM_compressed.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Compressed Training Data/User0013/Samsung - back/linearAccelDataM_compressed.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Compressed Training Data/User0014/Samsung - back/linearAccelDataM_compressed.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Compressed Training Data/User0015/Samsung - back/linearAccelDataM_compressed.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Compressed Training Data/User0016/Samsung - back/linearAccelDataM_compressed.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Compressed Training Data/User0017/Samsung - back/linearAccelDataM_compressed.txt"
+]
+testing_file_paths = [p.replace("Compressed Training Data", "Compressed Testing Data") for p in training_file_paths]
+auth(training_file_paths, testing_file_paths, used_device, TEST_N)
+
+# For HTC
+used_device = 'HTC'
+TEST_N = 350
+training_file_paths = [
+    "D:/Spring semester 2025/MLS/First Data set/data/Compressed Training Data/User001/HTC - front/linearAccelDataM_compressed.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Compressed Training Data/User002/HTC - front/linearAccelDataM_compressed.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Compressed Training Data/User003/HTC - front/linearAccelDataM_compressed.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Compressed Training Data/User004/HTC - front/linearAccelDataM_compressed.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Compressed Training Data/User005/HTC - front/linearAccelDataM_compressed.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Compressed Training Data/User006/HTC - front/linearAccelDataM_compressed.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Compressed Training Data/User007/HTC - front/linearAccelDataM_compressed.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Compressed Training Data/User008/HTC - front/linearAccelDataM_compressed.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Compressed Training Data/User009/HTC - front/linearAccelDataM_compressed.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Compressed Training Data/User0010/HTC - front/linearAccelDataM_compressed.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Compressed Training Data/User0011/HTC - front/linearAccelDataM_compressed.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Compressed Training Data/User0012/HTC - front/linearAccelDataM_compressed.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Compressed Training Data/User0013/HTC - front/linearAccelDataM_compressed.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Compressed Training Data/User0014/HTC - front/linearAccelDataM_compressed.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Compressed Training Data/User0015/HTC - front/linearAccelDataM_compressed.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Compressed Training Data/User0016/HTC - front/linearAccelDataM_compressed.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Compressed Training Data/User0017/HTC - front/linearAccelDataM_compressed.txt"
+]
+testing_file_paths = [p.replace("Compressed Training Data", "Compressed Testing Data") for p in training_file_paths]
+auth(training_file_paths, testing_file_paths, used_device, TEST_N)
+

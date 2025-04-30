@@ -1,0 +1,105 @@
+import pandas as pd
+import os
+import numpy as np
+
+# Base root directory for all algorithms
+root_base = r'D:\Spring semester 2025\MLS\Results - com'
+
+# Algorithm folders
+algorithms = ['BP', 'LGBM', 'CNN', 'FSL', 'LLM']
+# Device prefixes
+devices = ['SAM', 'HTC']
+# Metric columns to extract
+metrics_to_keep = ['SourceFile', 'FNR', 'FPR', 'TPR', 'TNR', 'Accuracy', 'F1-score']
+# Columns to exclude
+drop_cols = ['Pack ID', 'TP', 'TN', 'FP', 'FN', 'AUR', 'EER%']
+
+# Summary row labels
+summary_labels = [
+    'Best Accuracy',
+    'Best F1 Score',
+    'Least FPR',
+    'Median',
+    'Mean',
+    'Standard Deviation'
+]
+
+# Function to process one algorithm+device and return summary
+def process_algorithm_device(algorithm, device_prefix):
+    all_data = []
+    folder_path = os.path.join(root_base, algorithm)
+    for i in range(1, 17):
+        filename = f'confusion_table_{algorithm}_{device_prefix}{i}.xlsx'
+        file_path = os.path.join(folder_path, filename)
+        df = pd.read_excel(file_path)
+        df['SourceFile'] = i  # Add only the index (1 to 17)
+        all_data.append(df)
+
+    combined_df = pd.concat(all_data, ignore_index=True)
+
+    # Calculate 6 summary rows
+    summary_rows = []
+    for label in summary_labels:
+        row = None
+        if label == 'Best Accuracy':
+            row = combined_df.loc[combined_df['Accuracy'].idxmax()].copy()
+        elif label == 'Best F1 Score':
+            row = combined_df.loc[combined_df['F1-score'].idxmax()].copy()
+        elif label == 'Least FPR':
+            row = combined_df.loc[combined_df['FPR'].idxmin()].copy()
+        elif label == 'Median':
+            row = combined_df.sort_values('Accuracy').iloc[len(combined_df) // 2].copy()
+        elif label == 'Mean':
+            mean_vals = combined_df.select_dtypes(include=np.number).mean()
+            row = pd.Series({col: mean_vals[col] if col in mean_vals else '' for col in combined_df.columns})
+        elif label == 'Standard Deviation':
+            std_vals = combined_df.select_dtypes(include=np.number).std()
+            row = pd.Series({col: std_vals[col] if col in std_vals else '' for col in combined_df.columns})
+        row['SummaryType'] = f'{label} - {device_prefix}'
+        summary_rows.append(row)
+
+    # Create summary DataFrame
+    summary_df = pd.DataFrame(summary_rows)
+
+    # Drop unnecessary columns
+    summary_df = summary_df.drop(columns=[col for col in drop_cols if col in summary_df.columns])
+
+    # Round numeric values
+    for col in summary_df.select_dtypes(include=[np.number]).columns:
+        summary_df[col] = summary_df[col].round(1)
+
+    # Keep only relevant metric columns
+    summary_df = summary_df[['SummaryType'] + [col for col in metrics_to_keep if col in summary_df.columns]]
+
+    return summary_df
+
+# Collect summaries and reshape output to 19x36
+all_summaries = []
+
+for device in devices:
+    device_rows = []
+    for algorithm in algorithms:
+        summary_df = process_algorithm_device(algorithm, device)
+        summary_df = summary_df.set_index('SummaryType')
+        # Rename columns to include algorithm
+        summary_df.columns = [f"{col}: {algorithm}" for col in summary_df.columns]
+        device_rows.append(summary_df)
+    merged = pd.concat(device_rows, axis=1)
+    merged.reset_index(inplace=True)
+
+    # Reorder columns: group by metric across algorithms
+    ordered_cols = ['SummaryType']
+    for metric in metrics_to_keep:
+        ordered_cols.extend([f"{metric}: {alg}" for alg in algorithms])
+    merged = merged[ordered_cols]
+
+    all_summaries.append(merged)
+
+# Final shape will be 19 rows (6x3 + 1 header) x 36 columns
+final_df = pd.concat(all_summaries, axis=0, ignore_index=True)
+
+# Save to Excel
+output_path = os.path.join(root_base, 'All_Algorithms_Summary_19x36.xlsx')
+final_df.to_excel(output_path, index=False)
+
+print(f"Final summary saved to: {output_path}")

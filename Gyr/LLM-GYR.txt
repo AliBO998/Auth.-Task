@@ -1,0 +1,395 @@
+import os
+import random
+import numpy as np
+import pandas as pd
+import torch
+from torch.utils.data import Dataset, DataLoader
+from transformers import DistilBertTokenizerFast, DistilBertForSequenceClassification
+from torch.optim import AdamW
+from sklearn.metrics import (
+    roc_curve,
+    roc_auc_score,
+    confusion_matrix,
+    classification_report,
+)
+from sklearn.dummy import DummyClassifier
+import joblib
+
+# ============================
+# File Paths for Datasets: Samsung
+# ============================
+used_device = 'SAM'
+TEST_N = 5000   # samples for target user in testing; others get TEST_N/16
+training_file_paths = [
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User001/Samsung - back/gyroDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User002/Samsung - back/gyroDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User003/Samsung - back/gyroDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User004/Samsung - back/gyroDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User005/Samsung - back/gyroDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User006/Samsung - back/gyroDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User007/Samsung - back/gyroDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User008/Samsung - back/gyroDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User009/Samsung - back/gyroDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User0010/Samsung - back/gyroDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User0011/Samsung - back/gyroDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User0012/Samsung - back/gyroDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User0013/Samsung - back/gyroDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User0014/Samsung - back/gyroDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User0015/Samsung - back/gyroDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User0016/Samsung - back/gyroDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User0017/Samsung - back/gyroDataM.txt"
+]
+testing_file_paths = [p.replace("Training Data", "Testing Data") for p in training_file_paths]
+
+# ============================
+# Define the authentication for: Samsung (LLM method using DistilBERT)
+# ============================
+def auth(training_file_paths, testing_file_paths, used_device, TEST_N):
+
+    # ============================
+    # Hyperparameter Inputs
+    # ============================
+    EPOCHS = 16
+    BATCH_SIZE = 64
+    LEARNING_RATE = 1e-5
+    RANDOM_STATE = 42
+    MAX_LENGTH = 32  # Max token length for DistilBERT
+
+    # For reproducibility
+    torch.manual_seed(RANDOM_STATE)
+    np.random.seed(RANDOM_STATE)
+    random.seed(RANDOM_STATE)
+
+    # ============================
+    # Data and Text Conversion
+    # ============================
+    def numeric_to_text(x, y, z):
+        """
+        Converts numeric accelerometer data into a text string
+        so DistilBERT can process it.
+        Example: "x: 1.23 y: 4.56 z: -0.12"
+        """
+        return f"x: {x:.2f} y: {y:.2f} z: {z:.2f}"
+
+    def load_dataset(file_path, target_user):
+        """
+        Loads CSV (time, x, y, z) and returns X, y in NumPy form.
+        label=1 if target_user else 0
+        """
+        df = pd.read_csv(file_path, header=None, names=['time', 'x', 'y', 'z'])
+        X = df[['x','y','z']].values  # shape: (N,3)
+        y = np.ones(len(X)) if target_user else np.zeros(len(X))
+        return X, y
+
+    # ============================
+    # DistilBert Dataset Class
+    # ============================
+    class DistilBertAccelDataset(Dataset):
+        """
+        Custom dataset to transform numeric data into text and tokenize for DistilBERT.
+        """
+        def __init__(self, X, y, tokenizer, max_length=32):
+            self.X = X
+            self.y = y
+            self.tokenizer = tokenizer
+            self.max_length = max_length
+        
+        def __len__(self):
+            return len(self.X)
+        
+        def __getitem__(self, idx):
+            x_val, y_val, z_val = self.X[idx]
+            text = numeric_to_text(x_val, y_val, z_val)
+            encoding = self.tokenizer(
+                text,
+                truncation=True,
+                padding='max_length',
+                max_length=self.max_length,
+                return_tensors='pt'
+            )
+            item = {
+                'input_ids': encoding['input_ids'].squeeze(0),
+                'attention_mask': encoding['attention_mask'].squeeze(0),
+                'labels': torch.tensor(self.y[idx], dtype=torch.long)
+            }
+            return item
+
+    # ============================
+    # Training Loop with DistilBERT
+    # ============================
+    print("Training and validating for", used_device, "using LLM method...")
+    # List to store ROC data for combined plotting; each entry: (user_id, fpr, tpr, auc)
+    all_users_roc_data = []
+    
+    # Initialize tokenizer once
+    tokenizer = DistilBertTokenizerFast.from_pretrained('distilbert-base-uncased')
+
+    for u in range(len(training_file_paths)):
+        print(f"\n=== Processing Authentication for User {u+1} ===")
+        for i, file_path in enumerate(training_file_paths):
+            # 1) Load data
+            X, y = load_dataset(file_path, target_user=(i==u))
+            unique_classes = np.unique(y)
+            
+            # 2) Check if single-class data; if so, use DummyClassifier
+            if len(unique_classes) < 2:
+                const_value = int(unique_classes[0])
+                clf = DummyClassifier(strategy="constant", constant=const_value)
+                clf.fit(X, y)
+                model_save_path = f"D:/Spring semester 2025/MLS/Models/distilbert_model_user{i+1}.joblib"
+                joblib.dump(clf, model_save_path)
+                continue
+            
+            # 3) Create Torch dataset and dataloader
+            train_dataset = DistilBertAccelDataset(X, y, tokenizer, max_length=MAX_LENGTH)
+            train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+            
+            # 4) Initialize DistilBERT model
+            model = DistilBertForSequenceClassification.from_pretrained(
+                'distilbert-base-uncased',
+                num_labels=2
+            )
+            model.train()
+            optimizer = AdamW(model.parameters(), lr=LEARNING_RATE)
+            
+            # 5) Training loop
+            for epoch in range(EPOCHS):
+                total_loss = 0.0
+                for batch in train_loader:
+                    input_ids = batch['input_ids']
+                    attention_mask = batch['attention_mask']
+                    labels = batch['labels']
+                    
+                    outputs = model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        labels=labels
+                    )
+                    loss = outputs.loss
+                    optimizer.zero_grad()
+                    loss.backward()
+                    optimizer.step()
+                    
+                    total_loss += loss.item()
+                
+                avg_loss = total_loss / len(train_loader)
+                print(f"Dataset {i+1}, Epoch {epoch+1}/{EPOCHS}, Loss: {avg_loss:.4f}")
+            
+            # 6) Save the DistilBERT model
+            model_save_path = f"D:/Spring semester 2025/MLS/Models/distilbert_model_user{i+1}.pth"
+            torch.save(model.state_dict(), model_save_path)
+        
+        # ============================
+        # Testing & Confusion Table
+        # ============================
+        confusion_results = []
+        all_outputs = []
+        all_targets = []
+        roc_data = {}  # To store ROC data from final iteration for this user
+
+        for pack_id in range(20):
+            tp, tn, fp, fn = 0, 0, 0, 0
+            
+            for i, file_path in enumerate(testing_file_paths):
+                # 1) Load data
+                X, y = load_dataset(file_path, target_user=(i==u))
+                # 2) Sample data
+                sample_size = TEST_N if i==u else int(TEST_N/16)
+                indices = random.sample(range(len(X)), min(sample_size, len(X)))
+                X_test = X[indices]
+                y_test = y[indices]
+                
+                # 3) Load model (or DummyClassifier)
+                model_path = f"D:/Spring semester 2025/MLS/Models/distilbert_model_user{i+1}.pth"
+                dummy_path = f"D:/Spring semester 2025/MLS/Models/distilbert_model_user{i+1}.joblib"
+                if os.path.exists(dummy_path):
+                    clf = joblib.load(dummy_path)
+                    if clf.constant == 1:
+                        outputs = np.ones(len(X_test))
+                    else:
+                        outputs = np.zeros(len(X_test))
+                else:
+                    model = DistilBertForSequenceClassification.from_pretrained(
+                        'distilbert-base-uncased',
+                        num_labels=2
+                    )
+                    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+                    model.to(device)
+                    
+                    test_dataset = DistilBertAccelDataset(X_test, y_test, tokenizer, max_length=MAX_LENGTH)
+                    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
+                    
+                    outputs_list = []
+                    with torch.no_grad():
+                        for batch in test_loader:
+                            input_ids = batch['input_ids'].to(device)
+                            attention_mask = batch['attention_mask'].to(device)
+                            
+                            out = model(
+                                input_ids=input_ids,
+                                attention_mask=attention_mask
+                            )
+                            probs = torch.softmax(out.logits, dim=1)[:,1]
+                            outputs_list.extend(probs.cpu().numpy().tolist())
+                    
+                    outputs = np.array(outputs_list)
+                
+                preds = (outputs >= 0.5).astype(float)
+                all_outputs.extend(outputs.tolist())
+                all_targets.extend(y_test.tolist())
+                
+                tp += ((preds == 1) & (y_test == 1)).sum()
+                tn += ((preds == 0) & (y_test == 0)).sum()
+                fp += ((preds == 1) & (y_test == 0)).sum()
+                fn += ((preds == 0) & (y_test == 1)).sum()
+            
+            fnr = 100 * fn / (fn + tp) if (fn+tp) else 0
+            fpr = 100 * fp / (fp+tn) if (fp+tn) else 0
+            tpr = 100 * tp / (tp+fn) if (tp+fn) else 0
+            tnr = 100 * tn / (tn+fp) if (tn+fp) else 0
+            accuracy = 100 * (tp+tn) / (tp+tn+fp+fn) if (tp+tn+fp+fn) else 0
+            f1_score = 100 * (2*tp) / (2*tp+fp+fn) if (2*tp+fp+fn) else 0
+            
+            try:
+                aur = roc_auc_score(all_targets, all_outputs) * 100
+            except Exception:
+                aur = 0.0
+            
+            try:
+                all_outputs_arr = np.array(all_outputs)
+                all_targets_arr = np.array(all_targets)
+                fpr_vals, tpr_vals, thresholds = roc_curve(all_targets_arr, all_outputs_arr)
+                fnr_vals = 1 - tpr_vals
+                abs_diffs = np.abs(fpr_vals - fnr_vals)
+                min_index = np.argmin(abs_diffs)
+                eer = ((fpr_vals[min_index] + fnr_vals[min_index]) / 2) * 100
+            except Exception:
+                eer = 0.0
+            
+            confusion_results.append([
+                pack_id+1, tp, tn, fp, fn, fnr, fpr, tpr, tnr,
+                accuracy, f1_score, aur, eer
+            ])
+            
+            if pack_id == 19:
+                roc_data = {'fpr': fpr_vals, 'tpr': tpr_vals, 'auc': aur}
+        
+        # Save confusion table and summary statistics
+        confusion_df = pd.DataFrame(confusion_results, columns=[
+            "Pack ID", "TP", "TN", "FP", "FN", "FNR", "FPR", "TPR", "TNR", "Accuracy", "F1-score", "AUR", "EER%"
+        ])
+        excel_path = f"D:/Spring semester 2025/MLS/Results/LLM/confusion_table_LLM_{used_device}{u+1}.xlsx"
+        summary_df = confusion_df.drop("Pack ID", axis=1).agg(['mean', 'std'])
+        summary_df.rename(index={'mean': 'Average', 'std': 'Std Dev'}, inplace=True)
+        with pd.ExcelWriter(excel_path) as writer:
+            confusion_df.to_excel(writer, sheet_name="Confusion Table", index=False)
+            summary_df.to_excel(writer, sheet_name="Summary")
+        print(f"Confusion table and summary saved to {excel_path}")
+        
+        # Store ROC data for combined ROC plotting
+        if roc_data:
+            all_users_roc_data.append((u+1, roc_data['fpr'], roc_data['tpr'], roc_data['auc']))
+        
+        # Final confusion matrix & classification report
+        from sklearn.metrics import confusion_matrix, classification_report
+        all_outputs_arr = np.array(all_outputs)
+        all_targets_arr = np.array(all_targets)
+        predicted_labels = (all_outputs_arr >= 0.5).astype(int)
+        cm = confusion_matrix(all_targets_arr, predicted_labels)
+        report = classification_report(all_targets_arr, predicted_labels)
+        print("Confusion Matrix:")
+        print(cm)
+        print("\nClassification Report:")
+        print(report)
+    
+    # ============================
+    # Plot Combined ROC Curves for all Users
+    # ============================
+    if all_users_roc_data:
+        import matplotlib.pyplot as plt
+        plt.figure(figsize=(10, 8))
+        for user_id, fpr, tpr, auc in all_users_roc_data:
+            plt.plot(fpr, tpr, label=f'User {user_id} (AUC = {auc:.2f})')
+        plt.plot([0, 1], [0, 1], 'k--')
+        plt.xlabel('False Positive Rate')
+        plt.ylabel('True Positive Rate')
+        plt.title(f'ROC Curves for All Users (LLM - {used_device})')
+        # Place legend outside the plot (top–right)
+        plt.legend(loc='upper left', bbox_to_anchor=(1.05, 1), borderaxespad=0.)
+        
+        output_folder = os.path.dirname(excel_path)
+        roc_jpg_path = os.path.join(output_folder, f'roc_curves__LLM_{used_device}.jpg')
+        plt.savefig(roc_jpg_path, format='jpg', bbox_inches='tight')
+        print(f"Combined ROC curves saved as JPG at {roc_jpg_path}")
+        #plt.show()
+    
+    # -------------------------------
+    # Generate Excel file with ROC curve data for each user
+    # -------------------------------
+    if all_users_roc_data:
+        roc_excel_path = os.path.join(output_folder, f'roc_curves_LLM_{used_device}.xlsx')
+        with pd.ExcelWriter(roc_excel_path) as writer:
+            auc_summary = []
+            for user_id, fpr, tpr, auc in all_users_roc_data:
+                df_roc = pd.DataFrame({'FPR': fpr, 'TPR': tpr})
+                df_roc.to_excel(writer, sheet_name=f'User {user_id}', index=False)
+                auc_summary.append({'User': user_id, 'AUC': auc})
+            summary_df_roc = pd.DataFrame(auc_summary)
+            summary_df_roc.to_excel(writer, sheet_name='AUC Summary', index=False)
+        print(f"ROC curves data saved as Excel at {roc_excel_path}")
+
+auth(training_file_paths, testing_file_paths, used_device, TEST_N)
+
+# ============================
+# File Paths for Datasets: HTC
+# ============================
+used_device = 'HTC'
+TEST_N = 5000
+training_file_paths = [
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User001/HTC - front/gyroDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User002/HTC - front/gyroDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User003/HTC - front/gyroDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User004/HTC - front/gyroDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User005/HTC - front/gyroDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User006/HTC - front/gyroDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User007/HTC - front/gyroDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User008/HTC - front/gyroDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User009/HTC - front/gyroDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User0010/HTC - front/gyroDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User0011/HTC - front/gyroDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User0012/HTC - front/gyroDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User0013/HTC - front/gyroDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User0014/HTC - front/gyroDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User0015/HTC - front/gyroDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User0016/HTC - front/gyroDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User0017/HTC - front/gyroDataM.txt"
+]
+testing_file_paths = [p.replace("Training Data", "Testing Data") for p in training_file_paths]
+auth(training_file_paths, testing_file_paths, used_device, TEST_N)
+
+# ============================
+# File Paths for Datasets: Google Glasses
+# ============================
+used_device = 'GOO'
+TEST_N = 704
+training_file_paths = [
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User001/Glass/gyroData.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User002/Glass/gyroData.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User003/Glass/gyroData.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User004/Glass/gyroData.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User005/Glass/gyroData.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User006/Glass/gyroData.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User007/Glass/gyroData.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User008/Glass/gyroData.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User009/Glass/gyroData.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User0010/Glass/gyroData.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User0011/Glass/gyroData.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User0012/Glass/gyroData.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User0013/Glass/gyroData.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User0014/Glass/gyroData.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User0015/Glass/gyroData.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User0016/Glass/gyroData.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User0017/Glass/gyroData.txt"
+]
+testing_file_paths = [p.replace("Training Data", "Testing Data") for p in training_file_paths]
+auth(training_file_paths, testing_file_paths, used_device, TEST_N)

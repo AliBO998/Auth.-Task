@@ -1,0 +1,289 @@
+import os
+import random
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.metrics import roc_curve, roc_auc_score
+
+# -------------------------------
+# New auth function using BP2 coding
+# -------------------------------
+def auth(training_file_paths, testing_file_paths, used_device, TEST_N):
+    """
+    Authentication function modified to use BP2 (backpropagation neural network)
+    coding. For each dataset, the function trains a simple neural network (LocationPredictor)
+    and then tests it to produce a confusion table, ROC curve, and a summary sheet.
+    """
+
+    # BP2's load_dataset: reads CSV with (time, x, y, z) and converts features and targets.
+    def load_dataset(file_path, target_user):
+        df = pd.read_csv(file_path, header=None, names=['time', 'x', 'y', 'z'])
+        data = torch.tensor(df[['x', 'y', 'z']].values, dtype=torch.float32)
+        targets = torch.ones((len(data), 1), dtype=torch.float32) if target_user else torch.zeros((len(data), 1), dtype=torch.float32)
+        return TensorDataset(data, targets), df
+
+    # BP2's simple neural network model
+    class LocationPredictor(nn.Module):
+        def __init__(self, input_size, hidden_size, output_size):
+            super(LocationPredictor, self).__init__()
+            self.fc1 = nn.Linear(input_size, hidden_size)
+            self.relu = nn.ReLU()
+            self.fc2 = nn.Linear(hidden_size, output_size)
+            self.sigmoid = nn.Sigmoid()  # For binary classification
+        def forward(self, x):
+            x = self.fc1(x)
+            x = self.relu(x)
+            x = self.fc2(x)
+            x = self.sigmoid(x)
+            return x
+
+    # Hyperparameters
+    input_size = 3       # x, y, z
+    hidden_size = 2      # two neurons in the hidden layer
+    output_size = 1      # binary output (target user vs. others)
+    learning_rate = 0.001
+    epochs = 16
+    batch_size = 128
+
+    print("Training and validating for", used_device, "using BP method...")
+    # List to store ROC data for all users
+    all_users_roc_data = []
+
+    # -------------------------------
+    # Training loop: one model per training file (user)
+    # -------------------------------
+    for u in range(len(training_file_paths)):
+        print(f"\n=== Processing Authentication for User {u+1} ===")
+        # Train a model for each training file.
+        for i, file_path in enumerate(training_file_paths):
+            dataset, _ = load_dataset(file_path, target_user=(i == u))
+            data_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+            model = LocationPredictor(input_size, hidden_size, output_size)
+            criterion = nn.BCELoss()
+            optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+            
+            for epoch in range(epochs):
+                total_loss = 0.0
+                for inputs, targets in data_loader:
+                    outputs = model(inputs)
+                    loss = criterion(outputs, targets)
+                    optimizer.zero_grad()
+                    loss.backward()
+                    optimizer.step()
+                    total_loss += loss.item()
+                # Optionally print loss per epoch
+                # print(f"Dataset {i+1}, Epoch {epoch+1}/{epochs}, Loss: {total_loss/len(data_loader):.4f}")
+            
+            model_save_path = f"D:/Spring semester 2025/MLS/Models/location_predictor_model_user{i+1}.pth"
+            torch.save(model.state_dict(), model_save_path)
+            #print(f"Model for dataset {i+1} saved as '{model_save_path}'.")
+
+        # -------------------------------
+        # Testing loop: evaluate models on testing files and compile confusion table
+        # -------------------------------
+        confusion_results = []
+        roc_data = {}  # To store ROC data for this user from the final iteration
+
+        for pack_id in range(20):
+            tp, tn, fp, fn = 0, 0, 0, 0
+            all_outputs = []  # raw output probabilities
+            all_targets = []  # ground truth labels
+
+            for i, file_path in enumerate(testing_file_paths):
+                dataset, _ = load_dataset(file_path, target_user=(i == u))
+                sample_size = TEST_N if i == 0 else int(TEST_N / 16)
+                indices = random.sample(range(len(dataset)), min(sample_size, len(dataset)))
+                sampled_data = torch.stack([dataset[idx][0] for idx in indices])
+                sampled_targets = torch.stack([dataset[idx][1] for idx in indices])
+                
+                model = LocationPredictor(input_size, hidden_size, output_size)
+                model_load_path = f"D:/Spring semester 2025/MLS/Models/location_predictor_model_user{i+1}.pth"
+                state_dict = torch.load(model_load_path)
+                model.load_state_dict(state_dict)
+                model.eval()
+                
+                with torch.no_grad():
+                    outputs = model(sampled_data)
+                    predictions = (outputs >= 0.5).float()
+                    all_outputs.extend(outputs.cpu().numpy().flatten().tolist())
+                    all_targets.extend(sampled_targets.cpu().numpy().flatten().tolist())
+                    tp += ((predictions == 1) & (sampled_targets == 1)).sum().item()
+                    tn += ((predictions == 0) & (sampled_targets == 0)).sum().item()
+                    fp += ((predictions == 1) & (sampled_targets == 0)).sum().item()
+                    fn += ((predictions == 0) & (sampled_targets == 1)).sum().item()
+
+            fnr = 100 * fn / (fn + tp) if (fn + tp) > 0 else 0
+            fpr = 100 * fp / (fp + tn) if (fp + tn) > 0 else 0
+            tpr = 100 * tp / (tp + fn) if (tp + fn) > 0 else 0
+            tnr = 100 * tn / (tn + fp) if (tn + fp) > 0 else 0
+            accuracy = 100 * (tp + tn) / (tp + tn + fp + fn) if (tp + tn + fp + fn) > 0 else 0
+            f1_score = 100 * (2 * tp) / (2 * tp + fp + fn) if (2 * tp + fp + fn) > 0 else 0
+
+            try:
+                aur = roc_auc_score(all_targets, all_outputs) * 100
+            except Exception:
+                aur = 0.0
+
+            try:
+                all_outputs_arr = np.array(all_outputs)
+                all_targets_arr = np.array(all_targets)
+                fpr_vals, tpr_vals, thresholds = roc_curve(all_targets_arr, all_outputs_arr)
+                # Compute EER (optional, as already in confusion table)
+                fnr_vals = 1 - tpr_vals
+                abs_diffs = np.abs(fpr_vals - fnr_vals)
+                min_index = np.argmin(abs_diffs)
+                eer = ((fpr_vals[min_index] + fnr_vals[min_index]) / 2) * 100
+            except Exception:
+                eer = 0.0
+
+            confusion_results.append([
+                pack_id+1, tp, tn, fp, fn, fnr, fpr, tpr, tnr, accuracy, f1_score, aur, eer
+            ])
+
+            # For the final iteration, save ROC data for this user
+            if pack_id == 19:
+                roc_data = {'fpr': fpr_vals, 'tpr': tpr_vals, 'auc': aur}
+
+        # -------------------------------
+        # Save the confusion table and summary statistics to Excel
+        # -------------------------------
+        confusion_df = pd.DataFrame(confusion_results, columns=[
+            "Pack ID", "TP", "TN", "FP", "FN", "FNR", "FPR", "TPR", "TNR", "Accuracy", "F1-score", "AUR", "EER%"
+        ])
+        excel_path = f"D:/Spring semester 2025/MLS/Results/BP/confusion_table_BP_{used_device}{u+1}.xlsx"
+        
+        # Create summary statistics (average and std dev) for each metric (excluding Pack ID)
+        summary_df = confusion_df.drop("Pack ID", axis=1).agg(['mean', 'std'])
+        summary_df.rename(index={'mean': 'Average', 'std': 'Std Dev'}, inplace=True)
+        
+        with pd.ExcelWriter(excel_path) as writer:
+            confusion_df.to_excel(writer, sheet_name="Confusion Table", index=False)
+            summary_df.to_excel(writer, sheet_name="Summary")
+        print(f"Confusion table and summary saved to {excel_path}")
+
+        # If ROC data was obtained, store it for combined plotting.
+        if roc_data:
+            all_users_roc_data.append((u+1, roc_data['fpr'], roc_data['tpr'], roc_data['auc']))
+
+    
+    # -------------------------------
+    # After processing all users, plot combined ROC curves
+    # -------------------------------
+    if all_users_roc_data:
+        import matplotlib.pyplot as plt
+        plt.figure(figsize=(10, 8))
+        for user_id, fpr, tpr, auc in all_users_roc_data:
+            plt.plot(fpr, tpr, label=f'User {user_id} (AUC = {auc:.2f})')
+        plt.plot([0, 1], [0, 1], 'k--')
+        plt.xlabel('False Positive Rate')
+        plt.ylabel('True Positive Rate')
+        plt.title(f'ROC Curves for All Users (BP - {used_device})')
+        # Place legend outside at the top-right
+        plt.legend(loc='upper left', bbox_to_anchor=(1.05, 1), borderaxespad=0.)
+        
+        # Use the folder of the last Excel output for saving the ROC plot
+        output_folder = os.path.dirname(excel_path)
+        roc_jpg_path = os.path.join(output_folder, f'roc_curves__BP_{used_device}.jpg')
+        plt.savefig(roc_jpg_path, format='jpg', bbox_inches='tight')
+        print(f"Combined ROC curves saved as JPG at {roc_jpg_path}")
+        #plt.show()
+
+        # -------------------------------
+        # Generate Excel file with ROC curve data for each user
+        # -------------------------------
+        roc_excel_path = os.path.join(output_folder, f'roc_curves_BP_{used_device}.xlsx')
+        with pd.ExcelWriter(roc_excel_path) as writer:
+            auc_summary = []
+            for user_id, fpr, tpr, auc in all_users_roc_data:
+                # Create a DataFrame for the ROC data of this user
+                df = pd.DataFrame({'FPR': fpr, 'TPR': tpr})
+                # Save it to a separate sheet named "User X"
+                df.to_excel(writer, sheet_name=f'User {user_id}', index=False)
+                auc_summary.append({'User': user_id, 'AUC': auc})
+            # Also save an AUC summary sheet
+            summary_df = pd.DataFrame(auc_summary)
+            summary_df.to_excel(writer, sheet_name='AUC Summary', index=False)
+        print(f"ROC curves data saved as Excel at {roc_excel_path}")
+
+# --------------------------------------------------
+# Below, the file paths are set for different devices,
+# and the modified auth function is called accordingly.
+# --------------------------------------------------
+
+# For Samsung
+used_device = 'SAM'
+TEST_N = 5000   # Number of samples for the target user in testing; others get TEST_N/16
+training_file_paths = [
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User001/Samsung - back/accelDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User002/Samsung - back/accelDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User003/Samsung - back/accelDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User004/Samsung - back/accelDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User005/Samsung - back/accelDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User006/Samsung - back/accelDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User007/Samsung - back/accelDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User008/Samsung - back/accelDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User009/Samsung - back/accelDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User0010/Samsung - back/accelDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User0011/Samsung - back/accelDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User0012/Samsung - back/accelDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User0013/Samsung - back/accelDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User0014/Samsung - back/accelDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User0015/Samsung - back/accelDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User0016/Samsung - back/accelDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User0017/Samsung - back/accelDataM.txt"
+]
+testing_file_paths = [p.replace("Training Data", "Testing Data") for p in training_file_paths]
+auth(training_file_paths, testing_file_paths, used_device, TEST_N)
+
+# For HTC
+used_device = 'HTC'
+TEST_N = 5000
+training_file_paths = [
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User001/HTC - front/accelDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User002/HTC - front/accelDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User003/HTC - front/accelDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User004/HTC - front/accelDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User005/HTC - front/accelDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User006/HTC - front/accelDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User007/HTC - front/accelDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User008/HTC - front/accelDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User009/HTC - front/accelDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User0010/HTC - front/accelDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User0011/HTC - front/accelDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User0012/HTC - front/accelDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User0013/HTC - front/accelDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User0014/HTC - front/accelDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User0015/HTC - front/accelDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User0016/HTC - front/accelDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User0017/HTC - front/accelDataM.txt"
+]
+testing_file_paths = [p.replace("Training Data", "Testing Data") for p in training_file_paths]
+auth(training_file_paths, testing_file_paths, used_device, TEST_N)
+
+# For Google Glasses
+used_device = 'GOO'
+TEST_N = 704   # Adjusted sample size for target user; others get TEST_N/16
+training_file_paths = [
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User001/Glass/accelData.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User002/Glass/accelData.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User003/Glass/accelData.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User004/Glass/accelData.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User005/Glass/accelData.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User006/Glass/accelData.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User007/Glass/accelData.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User008/Glass/accelData.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User009/Glass/accelData.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User0010/Glass/accelData.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User0011/Glass/accelData.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User0012/Glass/accelData.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User0013/Glass/accelData.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User0014/Glass/accelData.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User0015/Glass/accelData.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User0016/Glass/accelData.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User0017/Glass/accelData.txt"
+]
+testing_file_paths = [p.replace("Training Data", "Testing Data") for p in training_file_paths]
+auth(training_file_paths, testing_file_paths, used_device, TEST_N)

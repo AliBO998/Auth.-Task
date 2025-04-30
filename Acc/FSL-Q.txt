@@ -1,0 +1,328 @@
+import pandas as pd
+import random
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, Dataset
+import joblib
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import roc_auc_score, roc_curve  # For ROC metrics
+import matplotlib.pyplot as plt  # For plotting ROC curve
+import os
+
+# -------------------------------
+# New auth function using BP2 coding (Few-Shot Learning with Siamese Network)
+# -------------------------------
+def auth(training_file_paths, testing_file_paths, used_device):
+    # Load Dataset from txt file
+    def load_dataset(file_path, target_user):
+        df = pd.read_csv(file_path, header=None, names=['time', 'x', 'y', 'z'])
+        data = df[['x', 'y', 'z']].values.astype(np.float32)
+        targets = np.array([1 if target_user else 0] * len(data), dtype=np.float32)
+        return data, targets, df
+
+    # Define the Siamese Network
+    class SiameseNetwork(nn.Module):
+        def __init__(self):
+            super(SiameseNetwork, self).__init__()
+            self.conv1 = nn.Conv1d(in_channels=1, out_channels=256, kernel_size=7, padding=3) 
+            self.bn1 = nn.BatchNorm1d(256)
+            self.relu = nn.ReLU()
+            self.conv2 = nn.Conv1d(in_channels=256, out_channels=512, kernel_size=5, padding=2) 
+            self.bn2 = nn.BatchNorm1d(512)
+            self.dropout = nn.Dropout(0.3)
+            self.fc1 = nn.Linear(512 * 3, 256)
+            self.fc2 = nn.Linear(256, 256)
+        
+        def forward(self, x):
+            x = x.unsqueeze(1)
+            x = self.relu(self.bn1(self.conv1(x)))
+            x = self.relu(self.bn2(self.conv2(x)))
+            x = x.view(x.size(0), -1)
+            x = self.dropout(self.relu(self.fc1(x)))
+            x = self.fc2(x)
+            return x
+
+    # Define the Triplet Loss for few-shot training
+    class TripletLoss(nn.Module):
+        def __init__(self, margin=1.0):
+            super(TripletLoss, self).__init__()
+            self.margin = margin
+        
+        def forward(self, anchor, positive, negative):
+            pos_distance = torch.nn.functional.pairwise_distance(anchor, positive)
+            neg_distance = torch.nn.functional.pairwise_distance(anchor, negative)
+            loss = torch.mean(torch.clamp(pos_distance - neg_distance + self.margin, min=0.0))
+            return loss
+
+    # Define the Siamese Dataset
+    class SiameseDataset(Dataset):
+        def __init__(self, dataset, targets):
+            self.dataset = dataset
+            self.targets = targets
+        
+        def __getitem__(self, index):
+            anchor = self.dataset[index]
+            anchor_label = self.targets[index]
+            positive_index = random.choice(np.where(self.targets == anchor_label)[0])
+            negative_index = random.choice(np.where(self.targets != anchor_label)[0])
+            positive = self.dataset[positive_index]
+            negative = self.dataset[negative_index]
+            return anchor, positive, negative, torch.tensor([1.0]), torch.tensor([0.0])
+        
+        def __len__(self):
+            return len(self.dataset)
+
+    print("Training and validating for", str(used_device), "...")
+    # List to store ROC data for each user
+    all_users_roc_data = []
+    
+    # -------------------------------
+    # Training loop: one model per training file (user)
+    # -------------------------------
+    for u in range(len(training_file_paths)):
+        print(f"\n=== Processing Authentication for User {u+1} ===")
+        X_train, y_train = [], []
+        for i, file_path in enumerate(training_file_paths):
+            data, targets, _ = load_dataset(file_path, target_user=(i == u))
+            X_train.append(data)
+            y_train.append(targets)
+        X_train = np.vstack(X_train)
+        y_train = np.hstack(y_train)
+
+        # Normalize Data
+        scaler = StandardScaler()
+        X_train = scaler.fit_transform(X_train)
+        X_train_tensor = torch.tensor(X_train, dtype=torch.float32)
+        y_train_tensor = torch.tensor(y_train, dtype=torch.float32)
+
+        # Create Siamese Dataset and DataLoader
+        train_dataset = SiameseDataset(X_train_tensor, y_train_tensor)
+        dataloader = DataLoader(train_dataset, batch_size=128, shuffle=True)
+
+        # Train Siamese Network
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model = SiameseNetwork().to(device)
+        criterion = TripletLoss()
+        optimizer = optim.AdamW(model.parameters(), lr=0.001)
+
+        for epoch in range(2):
+            total_loss = 0
+            for anchor, positive, negative, pos_label, neg_label in dataloader:
+                anchor, positive, negative = anchor.to(device), positive.to(device), negative.to(device)
+                pos_label, neg_label = pos_label.to(device), neg_label.to(device)
+                
+                optimizer.zero_grad()
+                anchor_out, positive_out, negative_out = model(anchor), model(positive), model(negative)
+                loss = criterion(anchor_out, positive_out, pos_label) + criterion(anchor_out, negative_out, neg_label)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+                total_loss += loss.item()
+            
+            print(f"Epoch {epoch+1}, Loss: {total_loss / len(dataloader):.4f}")
+
+        # Save Model
+        model_save_path = f"D:/Spring semester 2025/MLS/Models/siamese_model{u+1}.pth"
+        torch.save(model.state_dict(), model_save_path)
+        print(f"Siamese model saved as '{model_save_path}'.")
+
+        # Confusion Table Calculation
+        testing_file_paths = [path.replace("Training Data", "Testing Data") for path in training_file_paths]
+        confusion_results = []
+        roc_data = {}  # To store ROC data for this user
+        model.eval()
+        num_iterations = 20
+        for pack_id in range(num_iterations):
+            tp, tn, fp, fn = 0, 0, 0, 0
+            all_labels = []  # For ROC computation
+            all_scores = []  # Negative similarity scores (so that higher score means positive)
+            for i, file_path in enumerate(testing_file_paths):
+                X_test, y_test, _ = load_dataset(file_path, target_user=(i == u))
+                X_test = scaler.transform(X_test)
+                sampled_data = torch.tensor(X_test, dtype=torch.float32).to(device)
+                sampled_targets = torch.tensor(y_test, dtype=torch.float32).unsqueeze(1).to(device)
+                
+                with torch.no_grad():
+                    embeddings = model(sampled_data)
+                    reference_embedding = model(sampled_data[:1])  # Use first sample as reference
+                    similarities = torch.norm(embeddings - reference_embedding, dim=1)
+                    # Append true labels and negative similarity as score
+                    all_labels.extend(sampled_targets.cpu().numpy().flatten())
+                    all_scores.extend((-similarities).cpu().numpy())
+                    
+                    # Use fixed threshold (0.5) for confusion matrix
+                    predictions = (similarities < 0.5).float().unsqueeze(1)
+                    
+                    tp += ((predictions == 1) & (sampled_targets == 1)).sum().item()
+                    tn += ((predictions == 0) & (sampled_targets == 0)).sum().item()
+                    fp += ((predictions == 1) & (sampled_targets == 0)).sum().item()
+                    fn += ((predictions == 0) & (sampled_targets == 1)).sum().item()
+            
+            fnr = 100 * fn / (fn + tp) if (fn + tp) > 0 else 0
+            fpr = 100 * fp / (fp + tn) if (fp + tn) > 0 else 0
+            tpr = 100 * tp / (tp + fn) if (tp + fn) > 0 else 0
+            tnr = 100 * tn / (tn + fp) if (tn + fp) > 0 else 0
+            accuracy = 100 * (tp + tn) / (tp + tn + fp + fn) if (tp + tn + fp + fn) > 0 else 0
+            f1_score = 100 * (2 * tp) / (2 * tp + fp + fn) if (2 * tp + fp + fn) > 0 else 0
+            
+            try:
+                oc_auc = roc_auc_score(all_labels, all_scores) * 100
+                fpr_curve, tpr_curve, thresholds = roc_curve(all_labels, all_scores)
+                fnr_curve = 1 - tpr_curve
+                idx_eer = np.nanargmin(np.abs(fpr_curve - fnr_curve))
+                eer = fpr_curve[idx_eer]
+                eer_percentage = eer * 100
+            except Exception as e:
+                oc_auc = 0.0
+                eer_percentage = 0.0
+            
+            confusion_results.append([tp, tn, fp, fn, fnr, fpr, tpr, tnr, accuracy, f1_score, oc_auc, eer_percentage])
+            
+            if pack_id == num_iterations - 1:
+                roc_data = {
+                    'fpr': fpr_curve,
+                    'tpr': tpr_curve,
+                    'auc': oc_auc
+                }
+        
+        # Store ROC data (user index starts from 1)
+        if roc_data:
+            all_users_roc_data.append((u+1, roc_data['fpr'], roc_data['tpr'], roc_data['auc']))
+        
+        # Compute average and standard deviation of metrics over iterations
+        metrics_array = np.array(confusion_results)
+        avg_metrics = np.mean(metrics_array, axis=0)
+        std_metrics = np.std(metrics_array, axis=0)
+        
+        # Define metric names (including new metrics)
+        metric_names = ["TP", "TN", "FP", "FN", "FNR", "FPR", "TPR", "TNR", "Accuracy", "F1-score", "OC AUC", "EER%"]
+        
+        # Create DataFrame for iteration metrics and summary statistics
+        iterations = list(range(1, num_iterations + 1))
+        iteration_results = pd.DataFrame(confusion_results, columns=metric_names)
+        iteration_results.insert(0, "Iteration", iterations)
+        summary_results = pd.DataFrame([
+            ["Average"] + list(avg_metrics),
+            ["Std Dev"] + list(std_metrics)
+        ], columns=["Metric"] + metric_names)
+        
+        # Write results to Excel (one file per user)
+        excel_path = f"D:/Spring semester 2025/MLS/Results/FSL/confusion_table_FSL_{used_device}{u+1}.xlsx"
+        with pd.ExcelWriter(excel_path) as writer:
+            iteration_results.to_excel(writer, sheet_name="Iteration Metrics", index=False)
+            summary_results.to_excel(writer, sheet_name="Summary", index=False)
+        print(f"Confusion table with iteration metrics and summary saved to {excel_path}")
+
+    # -------------------------------
+    # After processing all users, plot combined ROC curves
+    # -------------------------------
+    if all_users_roc_data:
+        plt.figure(figsize=(10, 8))
+        for user_id, fpr, tpr, auc in all_users_roc_data:
+            plt.plot(fpr, tpr, label=f'User {user_id} (AUC = {auc:.2f})')
+        plt.plot([0, 1], [0, 1], 'k--')
+        plt.xlabel('False Positive Rate')
+        plt.ylabel('True Positive Rate')
+        plt.title('ROC Curves for All Users')
+        # Place legend outside the plot (top–right)
+        plt.legend(loc='upper left', bbox_to_anchor=(1.05, 1), borderaxespad=0.)
+        
+        # Use the folder of the last Excel output for saving the ROC plot
+        output_folder = os.path.dirname(excel_path)
+        roc_jpg_path = os.path.join(output_folder, f'roc_curves__FSL_{used_device}.jpg')
+        plt.savefig(roc_jpg_path, format='jpg', bbox_inches='tight')
+        print(f"Combined ROC curves saved as JPG at {roc_jpg_path}")
+        #plt.show()
+
+    # -------------------------------
+    # Generate Excel file with ROC curve data for each user
+    # -------------------------------
+    if all_users_roc_data:
+        roc_excel_path = os.path.join(output_folder, f'roc_curves_FSL_{used_device}.xlsx')
+        with pd.ExcelWriter(roc_excel_path) as writer:
+            auc_summary = []
+            for user_id, fpr, tpr, auc in all_users_roc_data:
+                df_roc = pd.DataFrame({'FPR': fpr, 'TPR': tpr})
+                df_roc.to_excel(writer, sheet_name=f'User {user_id}', index=False)
+                auc_summary.append({'User': user_id, 'AUC': auc})
+            summary_df_roc = pd.DataFrame(auc_summary)
+            summary_df_roc.to_excel(writer, sheet_name='AUC Summary', index=False)
+        print(f"ROC curves data saved as Excel at {roc_excel_path}")
+
+# --------------------------------------------------
+# File Paths for Different Devices and Running the Authentication
+# --------------------------------------------------
+
+# For Samsung
+used_device = 'SAM'
+training_file_paths = [
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User001/Samsung - back/accelDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User002/Samsung - back/accelDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User003/Samsung - back/accelDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User004/Samsung - back/accelDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User005/Samsung - back/accelDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User006/Samsung - back/accelDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User007/Samsung - back/accelDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User008/Samsung - back/accelDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User009/Samsung - back/accelDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User0010/Samsung - back/accelDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User0011/Samsung - back/accelDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User0012/Samsung - back/accelDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User0013/Samsung - back/accelDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User0014/Samsung - back/accelDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User0015/Samsung - back/accelDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User0016/Samsung - back/accelDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User0017/Samsung - back/accelDataM.txt"
+]
+testing_file_paths = [p.replace("Training Data", "Testing Data") for p in training_file_paths]
+auth(training_file_paths, testing_file_paths, used_device)
+
+# For HTC
+used_device = 'HTC'
+training_file_paths = [
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User001/HTC - front/accelDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User002/HTC - front/accelDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User003/HTC - front/accelDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User004/HTC - front/accelDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User005/HTC - front/accelDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User006/HTC - front/accelDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User007/HTC - front/accelDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User008/HTC - front/accelDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User009/HTC - front/accelDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User0010/HTC - front/accelDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User0011/HTC - front/accelDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User0012/HTC - front/accelDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User0013/HTC - front/accelDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User0014/HTC - front/accelDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User0015/HTC - front/accelDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User0016/HTC - front/accelDataM.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User0017/HTC - front/accelDataM.txt"
+]
+testing_file_paths = [p.replace("Training Data", "Testing Data") for p in training_file_paths]
+auth(training_file_paths, testing_file_paths, used_device)
+
+# For Google Glasses
+used_device = 'GOO'
+training_file_paths = [
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User001/Glass/accelData.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User002/Glass/accelData.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User003/Glass/accelData.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User004/Glass/accelData.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User005/Glass/accelData.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User006/Glass/accelData.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User007/Glass/accelData.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User008/Glass/accelData.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User009/Glass/accelData.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User0010/Glass/accelData.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User0011/Glass/accelData.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User0012/Glass/accelData.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User0013/Glass/accelData.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User0014/Glass/accelData.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User0015/Glass/accelData.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User0016/Glass/accelData.txt",
+    "D:/Spring semester 2025/MLS/First Data set/data/Training Data/User0017/Glass/accelData.txt"
+]
+testing_file_paths = [p.replace("Training Data", "Testing Data") for p in training_file_paths]
+auth(training_file_paths, testing_file_paths, used_device)
